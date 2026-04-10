@@ -1,0 +1,8 @@
+# 忽略所有 .env 文件
+.env
+
+# 忽略特定环境的 .env 文件（如 .env.local, .env.production 等）
+.env.*
+
+# 但是不要忽略示例文件（建议保留一个模板供他人参考）
+!.env.example

@@ -5,7 +5,7 @@ import psycopg
 import json
 import logging
 import time
-
+import re
 from app.config import llm, bge_embedding_model, DB_URL
 from app.schema_rag import get_schema_vectorstore
 from app.utils import is_safe_sql
@@ -25,37 +25,24 @@ class AgentState(TypedDict):
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 from langchain_core.prompts import PromptTemplate
-# 定义实体结构（使用 Pydantic）
+# 定义实体结构
 class ExtractedEntity(BaseModel):
     original: str = Field(description="用户查询中出现的原始文本")
-    entity_type: str = Field(description="实体类型，必须是以下之一: ward, poi_category, poi_name, rating, distance, infrastructure_name, infrastructure_type")
+    entity_type: str = Field(description="实体类型: ward, poi_category, poi_name, rating, distance, infrastructure_name, infrastructure_type")
     aliases: List[str] = Field(default=[], description="可能的别名、简称、全称（用于提高匹配率）")
 
 class EntityList(BaseModel):
     entities: List[ExtractedEntity] = Field(description="提取出的实体列表")
 
-# 创建 Parser（使用 Pydantic 严格约束）
 json_parser = JsonOutputParser(pydantic_object=EntityList)
 
-
-def entity_extractor(state: AgentState):
+def entity_extractor(state: dict):
     logger.info("【1】实体提取 Agent 开始")
     start = time.time()
 
-    # ==================== 优化后的 Prompt（重点加强） ====================
     prompt_template = PromptTemplate(
         template="""你是一个非常严谨、精确的实体提取助手。
-
-任务：从用户查询中提取所有关键实体，注意一定是具体得实体，不能提取抽象的概念，并以**严格的 JSON 格式**返回。
-
-**允许的 entity_type 只有以下几种（必须严格使用这些值，不要发明新类型）：**
-- "ward"                  → 行政区、区域（如涩谷行政区、新宿）
-- "poi_category"          → POI 类别（如餐厅、旅游、寺庙、购物）
-- "poi_name"              → 具体地点名称（如涩谷站、明治神宫、东京铁塔）
-- "infrastructure_name"   → 基础设施名称（如地铁站、公交站）
-- "infrastructure_type"   → 基础设施类型（如地铁、公交、道路）
-- "rating"                → 评分相关（如高于 4.5、评级 4.8 以上）
-- "distance"              → 距离相关（如 800 米以内、附近）
+任务：从用户查询中提取所有关键实体，注意一定是具体的实体，不能提取抽象的概念，并以**严格的 JSON 格式**返回。
 
 查询: {query}
 
@@ -66,188 +53,173 @@ def entity_extractor(state: AgentState):
 - "东京铁塔" → aliases: ["东京塔", "Tokyo Tower", "铁塔"]
 - "涩谷行政区" → aliases: ["涩谷", "Shibuya", "涩谷区"]
 - "餐厅" → aliases: ["饭店", "restaurant", "食堂"]
-- "基础设施" → aliases: ["设施", "infrastructure"]
 
 要求：
 - 只返回 JSON，不要添加任何解释、markdown 或额外文字。
 - 如果某个实体不确定类型，也要尽量映射到最接近的允许类型。
-- 评分相关必须用 "rating"，不要用 "rating_threshold"。
-- 尽可能为每个实体生成 1-3 个别名。
-
-请严格按照格式返回。""",
+- 评分相关必须用 "rating"。
+- 尽可能为每个实体生成 1-3 个别名。""",
         input_variables=["query"],
         partial_variables={"format_instructions": json_parser.get_format_instructions()}
     )
 
     prompt = prompt_template.format(query=state['query'])
-
-    logger.info("1.1 Prompt 已构建并发送给 LLM")
-    logger.debug("1.1.1 Prompt 内容预览:\n%s", prompt[:700])
-
-    # 调用 LLM
+    
     resp = llm.invoke([HumanMessage(content=prompt)])
     raw_content = resp.content.strip()
 
-    logger.info("1.2 LLM 原始返回内容:\n%s", raw_content)
-
-    # 使用 LangChain 的 JsonOutputParser 解析（这是你想要的，不再手动写 json.loads）
     try:
         parsed = json_parser.parse(raw_content)
         entities = parsed.get("entities", [])
-        
-        logger.info("1.3 实体提取成功 → 共 %d 个实体", len(entities))
-        for ent in entities:
-            logger.info("   → %s  →  %s", ent.get("original"), ent.get("entity_type"))
-
+        logger.info(f"1.3 实体提取成功 → 共 {len(entities)} 个实体")
     except Exception as e:
-        logger.error("1.3 Parser 解析失败: %s", e)
-        logger.debug("1.3.1 原始返回内容: %s", raw_content)
+        logger.error(f"1.3 Parser 解析失败: {e}")
         entities = []
 
-    logger.info("【1】实体提取 Agent 完成 (%.2fs)", time.time() - start)
+    logger.info(f"【1】实体提取 Agent 完成 ({time.time() - start:.2f}s)")
     return {"grounded_entities": entities}
 
 
-def dynamic_grounding(state: AgentState):
+def dynamic_grounding(state: dict):
     logger.info("【2】动态 Grounding Agent 开始（一元化真·混合搜索）")
     start = time.time()
     grounded = []
     entities = state.get("grounded_entities", [])
 
-    logger.info("2.1 需要处理的实体数量: %d", len(entities))
+    if not entities:
+        return {"grounded_entities": []}
 
-    for i, ent in enumerate(entities, 1):
-        original = ent.get("original", "")
-        aliases = ent.get("aliases", [])
-        etype = ent.get("entity_type", "poi_category")
+    # 🚀 优化 1：数据库连接池/连接上提，绝不能放在 for 循环里！
+    try:
+        conn = psycopg.connect(DB_URL)
+        cur = conn.cursor()
+    except Exception as e:
+        logger.error(f"数据库连接失败: {e}")
+        return {"grounded_entities": entities} # 降级返回原数据
 
-        # 搜索词列表：原始词 + 所有别名
-        search_terms = [original] + aliases
-        logger.info("2.2.%d 处理实体: '%s' (type=%s, 别名: %s)", i, original, etype, aliases)
+    try:
+        for i, ent in enumerate(entities, 1):
+            original = ent.get("original", "")
+            aliases = ent.get("aliases", [])
+            etype = ent.get("entity_type", "poi_category")
 
-        # 🚀 核心改动 1：坚决不做向量平均！
-        # 只使用用户原始输入提取向量，保障最纯粹的语义不被幻觉别名稀释
-        query_emb = bge_embedding_model.encode(original, normalize_embeddings=True).tolist()
-        query_emb_str = f"[{','.join(map(str, query_emb))}]"
+            search_terms = [original] + aliases
+            logger.info(f"2.2.{i} 处理实体: '{original}' (type={etype}, 别名: {aliases})")
 
-        try:
-            with psycopg.connect(DB_URL) as conn:
-                with conn.cursor() as cur:
-                    
-                    # 动态构建文本相似度打分逻辑
-                    if len(search_terms) == 1:
-                        text_sim_sql = "similarity(raw_value, %s)"
-                    else:
-                        sim_clauses = ", ".join(["similarity(raw_value, %s)"] * len(search_terms))
-                        text_sim_sql = f"GREATEST({sim_clauses})"
+            # 获取原始词向量
+            query_emb = bge_embedding_model.encode(original, normalize_embeddings=True).tolist()
+            query_emb_str = f"[{','.join(map(str, query_emb))}]"
 
-                    # 🚀 核心改动 2：双路召回 CTE 架构 (合并为一条 SQL 解决所有问题)
-                    # 路线 A: 向量索引极速搜索 (寻找语义相近)
-                    # 路线 B: 别名字面精准命中直通车 (保证你推理的别名 100% 进候选池)
-                    unified_sql = f"""
-                        WITH candidates AS (
-                            -- 路线 A：纯向量召回 (HNSW索引, 容错率强)
-                            (
-                                SELECT 
-                                    raw_value, source_table, source_column, entity_type,
-                                    (embedding <=> %s::vector) as vec_distance,
-                                    {text_sim_sql} as text_sim
-                                FROM value_embeddings
-                                ORDER BY embedding <=> %s::vector
-                                LIMIT 30
-                            )
-                            UNION
-                            -- 路线 B：精确/别名召回直通车 (哪怕向量偏了，只要别名对上就必抓进来)
-                            (
-                                SELECT 
-                                    raw_value, source_table, source_column, entity_type,
-                                    (embedding <=> %s::vector) as vec_distance,
-                                    {text_sim_sql} as text_sim
-                                FROM value_embeddings
-                                WHERE raw_value = ANY(%s)
-                                LIMIT 10
-                            )
-                        )
-                        SELECT
-                            raw_value, source_table, source_column, entity_type,
-                            vec_distance, text_sim,
-                            -- 🚀 核心改动 3：科学的平滑计分公式
-                            -- 向量为主(0.7) + 文本为辅(0.3) + 同类型奖励加成(0.05)
-                            (0.7 * (1 - vec_distance) + 0.3 * text_sim + 
-                             CASE WHEN entity_type = %s THEN 0.05 ELSE 0.0 END) as hybrid_score
-                        FROM candidates
-                        ORDER BY hybrid_score DESC
-                        LIMIT 5
-                    """
-                    
-                    # 严谨的参数绑定顺序（千万不能乱）
-                    params = [
-                        # === CTE路线 A (向量) ===
-                        query_emb_str,
-                        *search_terms,
-                        query_emb_str,
-                        # === CTE路线 B (文本直通车) ===
-                        query_emb_str,
-                        *search_terms,
-                        search_terms,   # ANY(%s) 会自动把 Python List 转为 Postgres 数组
-                        # === 外层打分 ===
-                        etype
-                    ]
-                    
-                    cur.execute(unified_sql, params)
-                    candidates = cur.fetchall()
+            # 动态构建文本相似度打分逻辑
+            if len(search_terms) == 1:
+                text_sim_sql = "similarity(raw_value, %s)"
+            else:
+                sim_clauses = ", ".join(["similarity(raw_value, %s)"] * len(search_terms))
+                text_sim_sql = f"GREATEST({sim_clauses})"
 
-        except Exception as e:
-            logger.error("2.3 数据库查询失败: %s", e)
-            candidates = []
+            # 🚀 优化 2：移除了不存在的 entity_type，路线B直接给 text_sim = 1.0 省去计算
+            unified_sql = f"""
+                WITH candidates AS (
+                    (
+                        SELECT 
+                            raw_value, source_table, source_column,
+                            (embedding <=> %s::vector) as vec_distance,
+                            {text_sim_sql} as text_sim
+                        FROM value_embeddings
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT 30
+                    )
+                    UNION
+                    (
+                        SELECT 
+                            raw_value, source_table, source_column,
+                            (embedding <=> %s::vector) as vec_distance,
+                            1.0 as text_sim  -- 完全匹配，相似度直接定为 1.0
+                        FROM value_embeddings
+                        WHERE raw_value = ANY(%s)
+                        LIMIT 10
+                    )
+                )
+                SELECT
+                    raw_value, source_table, source_column,
+                    vec_distance, text_sim,
+                    -- pgvector 的 <=> 返回距离，(1 - distance) 即为相似度
+                    (0.7 * (1 - vec_distance) + 0.3 * text_sim) as hybrid_score
+                FROM candidates
+                ORDER BY hybrid_score DESC
+                LIMIT 5
+            """
+            
+            params = [
+                query_emb_str,
+                *search_terms,
+                query_emb_str,
+                query_emb_str,
+                search_terms
+            ]
+            
+            cur.execute(unified_sql, params)
+            candidates = cur.fetchall()
 
-        # ==================== LLM 重排（处理最后一点歧义） ====================
-        if candidates and len(candidates) > 1:
-            top1_score = candidates[0][6]
-            top2_score = candidates[1][6]
+            # ==================== LLM 重排（处理最后一点歧义） ====================
+            if candidates and len(candidates) > 1:
+                top1_score = candidates[0][5]
+                top2_score = candidates[1][5]
 
-            if abs(top1_score - top2_score) < 0.10: # 放宽差异容忍度
-                logger.info("2.4.%d 分数接近 (%.3f vs %.3f)，启动 LLM 重排...", i, top1_score, top2_score)
-                candidates_str = "\n".join([
-                    f"{idx+1}. {c[0]} (来源: {c[1]}.{c[2]}, 库内类型: {c[3]}, 综合分: {c[6]:.3f})"
-                    for idx, c in enumerate(candidates[:3])
-                ])
+                if abs(top1_score - top2_score) < 0.10: 
+                    logger.info(f"2.4.{i} 分数接近 ({top1_score:.3f} vs {top2_score:.3f})，启动 LLM 重排...")
+                    candidates_str = "\n".join([
+                        f"{idx+1}. {c[0]} (来源: {c[1]}.{c[2]}, 综合分: {c[5]:.3f})"
+                        for idx, c in enumerate(candidates[:3])
+                    ])
 
-                rerank_prompt = f"""用户原始查询提及: "{original}"
+                    rerank_prompt = f"""用户原始查询提及: "{original}"
 我们找出了以下候选数据库标准命名:
 {candidates_str}
 
 判断哪一个最符合用户意图？只返回数字编号（1-3），无需解释。都不行返回 0。"""
-                try:
-                    resp = llm.invoke([HumanMessage(content=rerank_prompt)])
-                    choice = int(resp.content.strip())
-                    if 1 <= choice <= len(candidates):
-                        # 把选中的提升到第一位
-                        selected_candidate = candidates.pop(choice - 1)
-                        candidates.insert(0, selected_candidate)
-                        logger.info("2.4.%d LLM 重排完成，强制选择: %d", i, choice)
-                except Exception as e:
-                    logger.warning("2.4.%d LLM 重排失败: %s", i, e)
+                    try:
+                        resp = llm.invoke([HumanMessage(content=rerank_prompt)])
+                        # 🚀 优化 3：健壮的数字提取，防止 LLM 回复 "我选 1" 导致 int() 报错
+                        choice_match = re.search(r'\d+', resp.content)
+                        choice = int(choice_match.group()) if choice_match else 0
+                        
+                        if 1 <= choice <= len(candidates):
+                            selected_candidate = candidates.pop(choice - 1)
+                            candidates.insert(0, selected_candidate)
+                            logger.info(f"2.4.{i} LLM 重排完成，强制选择: {choice}")
+                    except Exception as e:
+                        logger.warning(f"2.4.{i} LLM 重排失败: {e}")
 
-        # ==================== 最终决策 ====================
-        if candidates and candidates[0][6] > 0.5:
-            best = {
-                "original": original,
-                "canonical": candidates[0][0],
-                "table": candidates[0][1],
-                "column": candidates[0][2],
-                "entity_type": candidates[0][3],
-                "confidence": candidates[0][6]
-            }
-            logger.info("2.5.%d ✓ 映射成功: '%s' → '%s' (得分: %.3f | 向量距: %.3f | 文本相似: %.3f | DB类型: %s)",
-                        i, original, best["canonical"], candidates[0][6], candidates[0][4], candidates[0][5], candidates[0][3])
-        else:
-            best = {"original": original, "canonical": original, "confidence": 0.5}
-            logger.info("2.5.%d ⚠ 映射失败，退化为原始值: '%s'", i, original)
+            # ==================== 最终决策 ====================
+            if candidates and candidates[0][5] > 0.5:
+                best = {
+                    "original": original,
+                    "canonical": candidates[0][0],
+                    "table": candidates[0][1],
+                    "column": candidates[0][2],
+                    "entity_type": etype,          # 透传大模型预测的类型给下游
+                    "confidence": candidates[0][5]
+                }
+                logger.info(f"2.5.{i} ✓ 映射成功: '{original}' → '{best['canonical']}' (得分: {candidates[0][5]:.3f})")
+            else:
+                # 降级保留原数据
+                best = {
+                    "original": original, 
+                    "canonical": original, 
+                    "entity_type": etype,
+                    "confidence": 0.5
+                }
+                logger.info(f"2.5.{i} ⚠ 映射失败，退化为原始值: '{original}'")
 
-        grounded.append(best)
+            grounded.append(best)
 
-    logger.info("【2】动态 Grounding Agent 完成 (%.2fs)，共处理 %d 个实体", time.time() - start, len(grounded))
+    finally:
+        # 确保游标和连接被安全关闭
+        cur.close()
+        conn.close()
+
+    logger.info(f"【2】动态 Grounding Agent 完成 ({time.time() - start:.2f}s)")
     return {"grounded_entities": grounded}
 
 def schema_retriever(state: AgentState):
