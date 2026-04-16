@@ -53,9 +53,8 @@ def is_safe_sql(sql: str) -> bool:
                 return False
 
     except Exception as e:
-        logger.warning("SQL 安全检查时解析失败: %s", e)
-        # 解析失败时保守通过（避免误杀复杂 SQL）
-        pass
+        logger.warning("SQL 安全检查时解析失败，默认拒绝: %s", e)
+        return False
 
     logger.debug("SQL 安全检查通过: %s...", sql_clean[:120])
     return True

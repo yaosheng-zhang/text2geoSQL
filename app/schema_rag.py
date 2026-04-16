@@ -1,9 +1,8 @@
 import logging
-from collections import defaultdict
 from typing import Any, Dict, List, Optional
 import warnings
 
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import create_engine, text, inspect, quoted_name
 from sqlalchemy.engine import Engine
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
@@ -12,14 +11,12 @@ from app.config import bge_embeddings, DB_URL
 
 logger = logging.getLogger(__name__)
 
-# 忽略 SQLAlchemy 对 pgvector 类型的警告
 warnings.filterwarnings("ignore", message="Did not recognize type 'vector'")
 warnings.filterwarnings("ignore", category=Warning, module="sqlalchemy")
 
 
-# ====================== MSchema 核心类（融合版） ======================
+# ====================== MSchema 核心类 ======================
 class MSchema:
-    """官方 M-Schema 核心类 + 增强（包含你的隐式 FK 和 JOIN Paths）"""
     def __init__(self, db_id: str = "Anonymous", schema: Optional[str] = None):
         self.db_id = db_id
         self.schema = schema
@@ -124,7 +121,6 @@ class MSchema:
             lines.extend(field_lines)
             lines.append("]")
 
-            # JOIN Paths
             fks_out = [fk for fk in self.foreign_keys if fk[0] == table_name]
             fks_in = [fk for fk in self.foreign_keys if fk[2] == table_name] + self.implicit_foreign_keys
 
@@ -158,19 +154,17 @@ class MSchema:
         return "\n".join(lines)
 
 
-# ====================== 修复后的 EnhancedSchemaEngine ======================
+# ====================== EnhancedSchemaEngine ======================
 class EnhancedSchemaEngine:
-    IGNORE_TABLES = {'spatial_ref_sys', 'geometry_columns', 'geography_columns','value_embeddings'}
+    IGNORE_TABLES = {'spatial_ref_sys', 'geometry_columns', 'geography_columns', 'value_embeddings'}
 
     def __init__(self, db_url: str = DB_URL, sample_rows: int = 5):
-        self.engine: Engine = create_engine(db_url, echo=False)
+        self.engine: Engine = create_engine(db_url, echo=False, pool_pre_ping=True)
         self.mschema = MSchema(db_id="dynamic_db", schema="public")
         self.has_spatial_data = False
         self.sample_rows = sample_rows
 
     def build(self) -> MSchema:
-        """完整构建流程 — 已修复 inspect"""
-        # === 关键修复：使用 inspect(self.engine) ===
         inspector = inspect(self.engine)
 
         tables = inspector.get_table_names(schema="public")
@@ -178,13 +172,11 @@ class EnhancedSchemaEngine:
             if table_name in self.IGNORE_TABLES:
                 continue
 
-            # 获取表注释
             comment_dict = inspector.get_table_comment(table_name, schema="public")
             comment = comment_dict.get("text", "") if isinstance(comment_dict, dict) else ""
 
             self.mschema.add_table(table_name, comment=comment)
 
-            # 字段信息
             columns = inspector.get_columns(table_name, schema="public")
             pk_constraint = inspector.get_pk_constraint(table_name, schema="public")
             pk_cols = pk_constraint.get("constrained_columns", [])
@@ -197,7 +189,7 @@ class EnhancedSchemaEngine:
                 if any(x in col_type.lower() for x in ("geometry", "geography")):
                     self.has_spatial_data = True
 
-                examples = self._fetch_distinct_values(table_name, col_name)
+                examples = []  # will be fetched in batch below
 
                 self.mschema.add_field(
                     table_name=table_name,
@@ -211,7 +203,6 @@ class EnhancedSchemaEngine:
                     examples=examples
                 )
 
-            # 显式外键
             fks = inspector.get_foreign_keys(table_name, schema="public")
             for fk in fks:
                 for c_col, r_col in zip(fk["constrained_columns"], fk["referred_columns"]):
@@ -219,26 +210,34 @@ class EnhancedSchemaEngine:
                         table_name, c_col, fk["referred_table"], r_col, "物理外键"
                     )
 
-        # 隐式外键推断（你的核心优势）
+        # Batch fetch all distinct values with a single connection
+        self._batch_fetch_examples()
+
         self.mschema.infer_implicit_fks(ignore_tables=self.IGNORE_TABLES)
 
-        logger.info(f"✅ M-Schema 构建完成：{len(self.mschema.tables)} 张表，"
-                    f"显式 FK {len(self.mschema.foreign_keys)}，逻辑 FK {len(self.mschema.implicit_foreign_keys)}")
+        logger.info("M-Schema 构建完成: %d 张表, 显式 FK %d, 逻辑 FK %d",
+                     len(self.mschema.tables),
+                     len(self.mschema.foreign_keys),
+                     len(self.mschema.implicit_foreign_keys))
         return self.mschema
 
-    def _fetch_distinct_values(self, table_name: str, column_name: str) -> List:
-        query = text(f"""
-            SELECT DISTINCT {column_name} 
-            FROM {table_name} 
-            WHERE {column_name} IS NOT NULL 
-            LIMIT {self.sample_rows}
-        """)
-        try:
-            with self.engine.connect() as conn:
-                result = conn.execute(query)
-                return [row[0] for row in result.fetchall() if row[0] is not None]
-        except Exception:
-            return []
+    def _batch_fetch_examples(self):
+        """Fetch distinct values for all columns using a single connection."""
+        with self.engine.connect() as conn:
+            for table_name, table_info in self.mschema.tables.items():
+                for col_name, col_info in table_info["fields"].items():
+                    try:
+                        # Use quoted identifiers to prevent SQL injection
+                        query = text(
+                            f'SELECT DISTINCT "{table_name}"."{col_name}" '
+                            f'FROM "{table_name}" '
+                            f'WHERE "{table_name}"."{col_name}" IS NOT NULL '
+                            f'LIMIT :limit'
+                        )
+                        result = conn.execute(query, {"limit": self.sample_rows})
+                        col_info["examples"] = [row[0] for row in result.fetchall() if row[0] is not None]
+                    except Exception:
+                        col_info["examples"] = []
 
     def get_docs(self) -> List[Document]:
         self.build()
@@ -263,7 +262,7 @@ General SQL & PostGIS Knowledge (No specific tables):
                 metadata={"table": "postgis_guide", "type": "dialect_guide"}
             ))
 
-        logger.info(f"✅ 生成 {len(docs)} 个 M-Schema 知识块")
+        logger.info("生成 %d 个 M-Schema 知识块", len(docs))
         return docs
 
     def _single_table_enhanced_doc(self, table_name: str) -> str:
@@ -278,7 +277,6 @@ General SQL & PostGIS Knowledge (No specific tables):
             ex = f" [Examples: {col.get('examples', [])[:2]}]" if col.get("examples") else ""
             lines.append(f"  - {col_name} ({col['type']}){pk_mark}{ex}")
 
-        # JOIN Paths
         fks_out = [fk for fk in self.mschema.foreign_keys if fk[0] == table_name]
         fks_in = [fk for fk in self.mschema.foreign_keys if fk[2] == table_name]
 
@@ -298,44 +296,42 @@ General SQL & PostGIS Knowledge (No specific tables):
         return "\n".join(lines)
 
 
-# ====================== 对外接口（无缝替换你原来的函数） ======================
+# ====================== 对外接口 ======================
 _vectorstore = None
 _schema_docs_cache = None
 
 def get_dynamic_m_schema_docs() -> list[Document]:
-    """推荐使用的接口 - 带缓存"""
     global _schema_docs_cache
 
     if _schema_docs_cache is not None:
-        logger.info("📦 使用缓存的 Schema 文档 (%d 个知识块)", len(_schema_docs_cache))
+        logger.info("使用缓存的 Schema 文档 (%d 个知识块)", len(_schema_docs_cache))
         return _schema_docs_cache
 
     try:
-        logger.info("🚀 正在执行【融合版 M-Schema】自动化构建...")
+        logger.info("正在执行 M-Schema 自动化构建...")
         engine = EnhancedSchemaEngine(DB_URL)
         _schema_docs_cache = engine.get_docs()
-        logger.info("✅ M-Schema 文档缓存完成")
+        logger.info("M-Schema 文档缓存完成")
         return _schema_docs_cache
     except Exception as e:
-        logger.error("❌ 融合版 M-Schema 构建失败: %s", e, exc_info=True)
+        logger.error("M-Schema 构建失败: %s", e, exc_info=True)
         raise
 
 
 def get_schema_vectorstore():
-    """获取 Schema 向量库 - 带缓存和性能优化"""
     global _vectorstore
 
     if _vectorstore is not None:
-        logger.info("📦 使用缓存的 Schema 向量库")
+        logger.info("使用缓存的 Schema 向量库")
         return _vectorstore
 
-    logger.info("🔄 正在初始化 Schema RAG 内存向量库（融合版）...")
+    logger.info("正在初始化 Schema RAG 内存向量库...")
     import time
     start = time.time()
 
     try:
         schema_docs = get_dynamic_m_schema_docs()
-        logger.info("📝 开始向量化 %d 个 Schema 文档...", len(schema_docs))
+        logger.info("开始向量化 %d 个 Schema 文档...", len(schema_docs))
 
         _vectorstore = InMemoryVectorStore.from_documents(
             documents=schema_docs,
@@ -343,12 +339,8 @@ def get_schema_vectorstore():
         )
 
         elapsed = time.time() - start
-        logger.info("✅ Schema RAG 初始化完成 (%.2fs)，共 %d 个知识块", elapsed, len(schema_docs))
-
-        if elapsed > 60:
-            logger.warning("⚠️  初始化耗时较长 (%.2fs)，后续查询将使用缓存加速", elapsed)
-
+        logger.info("Schema RAG 初始化完成 (%.2fs), 共 %d 个知识块", elapsed, len(schema_docs))
         return _vectorstore
     except Exception as e:
-        logger.error("❌ Schema RAG 初始化失败: %s", e, exc_info=True)
+        logger.error("Schema RAG 初始化失败: %s", e, exc_info=True)
         raise
