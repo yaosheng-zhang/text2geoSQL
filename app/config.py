@@ -1,7 +1,6 @@
 import os
 import logging
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 from langchain_core.embeddings import Embeddings
 from sentence_transformers import SentenceTransformer
 
@@ -12,18 +11,15 @@ logger = logging.getLogger(__name__)
 DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres123@localhost:5432/spatial_kb")
 API_KEY = os.getenv("API_KEY", "test-key")
 
-# ====================== LLM（走中转站） ======================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+# ====================== LLM（工厂模式，支持多种供应商） ======================
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
 LLM_MODEL = os.getenv("MODEL_NAME", "gpt-4o")
+
 EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH", "d:/work/text2sql2/models/bge-m3")
 
-llm = ChatOpenAI(
-    model=LLM_MODEL,
-    api_key=OPENAI_API_KEY,
-    base_url=OPENAI_BASE_URL,
-    temperature=0.0,
-)
+from app.llm_provider import create_llm
+
+llm = create_llm()
 
 # ====================== 统一 BAAI/bge-m3（只加载一次） ======================
 class BGEEmbeddings(Embeddings):
@@ -50,4 +46,4 @@ except Exception as e:
     logger.error("Embedding 模型加载失败: %s", e, exc_info=True)
     raise
 
-logger.info("配置加载完成 | LLM: %s | Base URL: %s | Embedding: %s", LLM_MODEL, OPENAI_BASE_URL, EMBEDDING_MODEL_PATH)
+logger.info("配置加载完成 | Provider: %s | Model: %s | Embedding: %s", LLM_PROVIDER, LLM_MODEL, EMBEDDING_MODEL_PATH)

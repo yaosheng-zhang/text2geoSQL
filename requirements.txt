@@ -9,3 +9,9 @@ langchain-community==0.3.14
 sentence-transformers==3.3.1
 python-dotenv==1.0.1
 pydantic==2.10.1
+
+# ---- LLM 供应商可选依赖（按需安装） ----
+# Ollama:       pip install langchain-ollama
+# Anthropic:    pip install langchain-anthropic
+# 智谱 AI:      pip install zhipuai
+# Azure OpenAI: 已包含在 langchain-openai 中，无需额外安装
