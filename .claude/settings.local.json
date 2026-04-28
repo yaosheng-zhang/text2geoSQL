@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Read(//c/Users/Administrator/.cache/huggingface/hub/**)",
+      "Read(//c/Users/Administrator/.cache/huggingface/hub//**)",
+      "Read(//d/work/text2sql2/**)",
+      "Bash(mkdir -p d:/work/text2sql2/models)",
+      "Bash(cp -rL ~/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181/. d:/work/text2sql2/models/bge-m3/)"
     ]
   }
 }

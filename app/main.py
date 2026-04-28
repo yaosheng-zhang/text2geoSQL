@@ -15,8 +15,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+import asyncio
+
 from app.db import get_connection, close_pool, get_pool
 from app.multi_agent import run_text2geosql
+from app.few_shot import ensure_table as ensure_few_shot_table, save_example as save_few_shot_example
+from app.schema_rag import get_schema_vectorstore
 
 
 # ====================== 生命周期管理 ======================
@@ -39,6 +43,17 @@ async def lifespan(app: FastAPI):
 
     if not db_ok:
         logger.warning("Database unavailable, service starting in degraded mode")
+    else:
+        ensure_few_shot_table()
+        # 预热 Schema 向量库（避免首次查询时卡顿）
+        # 使用 run_in_executor 避免阻塞 async lifespan 事件循环
+        logger.info("预热 Schema 向量库（后台线程中运行）...")
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, get_schema_vectorstore)
+            logger.info("Schema 向量库预热完成")
+        except Exception as e:
+            logger.warning("Schema 向量库预热失败（非阻塞）: %s", e)
 
     logger.info("=" * 70)
     logger.info("Service ready")
@@ -133,7 +148,8 @@ async def query(request: QueryRequest):
             logger.info("Executing SQL (fallback)...")
             with get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(f"SET statement_timeout = '10s'; {sql}")
+                    cur.execute("SET statement_timeout = '10s'")
+                    cur.execute(sql)
                     rows = cur.fetchall()
                     col_names = [desc[0] for desc in cur.description] if cur.description else []
 
@@ -141,6 +157,12 @@ async def query(request: QueryRequest):
 
         results = _build_results(rows, col_names)
         logger.info("Returning %d results", len(results))
+
+        # 闭环学习：成功执行且返回非空结果时，异步保存 (query, sql) 对用于未来 few-shot 检索
+        if error is None and rows is not None and len(rows) > 0:
+            asyncio.create_task(
+                asyncio.to_thread(save_few_shot_example, request.query, sql)
+            )
 
         return {
             "sql": sql,

@@ -10,13 +10,14 @@ import time
 
 from app.config import llm, bge_embedding_model
 from app.db import get_connection
-from app.schema_rag import get_schema_vectorstore
+from app.schema_rag import get_schema_vectorstore, get_schema_summary, has_spatial_data
 from app.utils import is_safe_sql
+from app.few_shot import search_similar_examples
 from app.prompts import (
     ENTITY_EXTRACTION_TEMPLATE,
     RERANK_TEMPLATE,
-    SQL_GENERATION_SYSTEM_TEMPLATE,
-    SQL_FIX_TEMPLATE,
+    build_sql_generation_prompt,
+    build_sql_fix_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,7 @@ class EntityList(BaseModel):
 json_parser = JsonOutputParser(pydantic_object=EntityList)
 
 
-# ====================== Helper: strip markdown code fences ======================
+# ====================== Helpers ======================
 def strip_sql_markdown(raw: str) -> str:
     """Remove ```sql ... ``` wrappers from LLM output."""
     sql = raw.strip()
@@ -59,20 +60,47 @@ def strip_sql_markdown(raw: str) -> str:
     return sql
 
 
+def _classify_error(err_msg: str) -> str:
+    """粗略将 PostgreSQL 错误分类，用于帮助 LLM 聚焦修复方向。"""
+    e = err_msg.lower()
+    if "column" in e and ("does not exist" in e or "unknown" in e):
+        return "列名错误"
+    if "relation" in e and "does not exist" in e:
+        return "表名错误"
+    if "function" in e and "does not exist" in e:
+        return "函数不存在"
+    if "operator does not exist" in e or "invalid input syntax" in e or "cast" in e:
+        return "类型不匹配"
+    if "syntax error" in e:
+        return "语法错误"
+    if "join" in e:
+        return "JOIN 错误"
+    return "未分类错误"
+
+
 # ====================== Agent Nodes ======================
 
 def entity_extractor(state: dict):
-    """Node 1: Extract entities from user query."""
-    logger.info("[1] Entity Extractor start")
+    """Node 1: Schema-aware 实体提取。
+
+    注入 schema 摘要，让 LLM 基于真实表/列结构提取实体，而不是凭空猜测。
+    """
+    logger.info("[1] Entity Extractor (schema-aware) start")
     start = time.time()
+
+    try:
+        schema_summary = get_schema_summary(max_cols_per_table=8)
+    except Exception as e:
+        logger.warning("[1] 获取 schema summary 失败，回退为无上下文模式: %s", e)
+        schema_summary = "（暂无 schema 信息）"
 
     prompt_template = PromptTemplate(
         template=ENTITY_EXTRACTION_TEMPLATE,
-        input_variables=["query"],
+        input_variables=["query", "schema_summary"],
         partial_variables={"format_instructions": json_parser.get_format_instructions()}
     )
 
-    prompt = prompt_template.format(query=state['query'])
+    prompt = prompt_template.format(query=state['query'], schema_summary=schema_summary)
     resp = llm.invoke([HumanMessage(content=prompt)])
     raw_content = resp.content.strip()
 
@@ -105,39 +133,55 @@ def dynamic_grounding(state: AgentState):
 
     logger.info("[2] Entities to process: %d", len(entities))
 
-    # --- Batch encode all entity originals at once ---
-    originals = [ent.get("original", "") for ent in entities]
+    # groundable 类型：value/keyword 需要匹配具体值；status_condition 也要匹配枚举值
+    # （如"已完成" → status='completed'）；numeric_condition / date_condition 跳过
+    GROUNDABLE_TYPES = ("value", "keyword", "status_condition")
+    groundable = [e for e in entities if e.get("entity_type") in GROUNDABLE_TYPES]
+    if not groundable:
+        logger.info("[2] 所有实体均为数值/日期条件，跳过值匹配")
+        return {"grounded_entities": entities}
+
+    originals = [ent.get("original", "") for ent in groundable]
     all_embeddings = bge_embedding_model.encode(originals, normalize_embeddings=True, batch_size=32)
     logger.info("[2] Batch encoded %d entity embeddings", len(originals))
 
-    # --- Single DB connection for all entities ---
+    emb_map = {groundable[i].get("original", ""): all_embeddings[i] for i in range(len(groundable))}
+
     with get_connection() as conn:
         for i, ent in enumerate(entities):
             original = ent.get("original", "")
-            aliases = ent.get("aliases", [])
-            etype = ent.get("entity_type", "poi_category")
+            etype = ent.get("entity_type", "value")
 
+            # 非 groundable 类型实体不做值匹配，原样保留
+            if etype not in GROUNDABLE_TYPES:
+                grounded.append({
+                    "original": original,
+                    "canonical": original,
+                    "entity_type": etype,
+                    "confidence": 1.0,
+                })
+                continue
+
+            aliases = ent.get("aliases", [])
             search_terms = [original] + aliases
             logger.info("[2.%d] Entity: '%s' (type=%s, aliases=%s)", i + 1, original, etype, aliases)
 
-            query_emb = all_embeddings[i].tolist()
+            query_emb = emb_map[original].tolist()
             query_emb_str = f"[{','.join(map(str, query_emb))}]"
 
             try:
                 with conn.cursor() as cur:
-                    # Build dynamic text similarity expression
                     if len(search_terms) == 1:
                         text_sim_sql = "similarity(raw_value, %s)"
                     else:
                         sim_clauses = ", ".join(["similarity(raw_value, %s)"] * len(search_terms))
                         text_sim_sql = f"GREATEST({sim_clauses})"
 
-                    # Dual-path recall: vector HNSW + exact alias match
                     unified_sql = f"""
                         WITH candidates AS (
                             (
                                 SELECT
-                                    raw_value, source_table, source_column, entity_type,
+                                    raw_value, source_table, source_column,
                                     (embedding <=> %s::vector) as vec_distance,
                                     {text_sim_sql} as text_sim
                                 FROM value_embeddings
@@ -147,7 +191,7 @@ def dynamic_grounding(state: AgentState):
                             UNION
                             (
                                 SELECT
-                                    raw_value, source_table, source_column, entity_type,
+                                    raw_value, source_table, source_column,
                                     (embedding <=> %s::vector) as vec_distance,
                                     {text_sim_sql} as text_sim
                                 FROM value_embeddings
@@ -156,26 +200,17 @@ def dynamic_grounding(state: AgentState):
                             )
                         )
                         SELECT
-                            raw_value, source_table, source_column, entity_type,
+                            raw_value, source_table, source_column,
                             vec_distance, text_sim,
-                            (0.7 * GREATEST(1.0 - vec_distance, 0.0) + 0.3 * text_sim +
-                             CASE WHEN entity_type = %s THEN 0.05 ELSE 0.0 END) as hybrid_score
+                            (0.7 * GREATEST(1.0 - vec_distance, 0.0) + 0.3 * text_sim) as hybrid_score
                         FROM candidates
                         ORDER BY hybrid_score DESC
                         LIMIT 5
                     """
 
                     params = [
-                        # CTE path A (vector)
-                        query_emb_str,
-                        *search_terms,
-                        query_emb_str,
-                        # CTE path B (exact alias)
-                        query_emb_str,
-                        *search_terms,
-                        search_terms,
-                        # outer scoring
-                        etype
+                        query_emb_str, *search_terms, query_emb_str,
+                        query_emb_str, *search_terms, search_terms,
                     ]
 
                     cur.execute(unified_sql, params)
@@ -185,16 +220,16 @@ def dynamic_grounding(state: AgentState):
                 logger.error("[2.%d] DB query failed: %s", i + 1, e)
                 candidates = []
 
-            # LLM rerank when top scores are close
+            # LLM rerank 当 top-1/2 分数接近
             if candidates and len(candidates) > 1:
-                top1_score = candidates[0][6]
-                top2_score = candidates[1][6]
+                top1_score = candidates[0][5]
+                top2_score = candidates[1][5]
 
                 if abs(top1_score - top2_score) < 0.10:
                     logger.info("[2.%d] Scores close (%.3f vs %.3f), triggering LLM rerank",
                                 i + 1, top1_score, top2_score)
                     candidates_str = "\n".join([
-                        f"{idx + 1}. {c[0]} (source: {c[1]}.{c[2]}, db_type: {c[3]}, score: {c[6]:.3f})"
+                        f"{idx + 1}. {c[0]} (source: {c[1]}.{c[2]}, score: {c[5]:.3f})"
                         for idx, c in enumerate(candidates[:3])
                     ])
 
@@ -213,21 +248,20 @@ def dynamic_grounding(state: AgentState):
                     except Exception as e:
                         logger.warning("[2.%d] LLM rerank failed: %s", i + 1, e)
 
-            # Final decision
-            if candidates and candidates[0][6] > 0.5:
+            if candidates and candidates[0][5] > 0.5:
                 best = {
                     "original": original,
                     "canonical": candidates[0][0],
                     "table": candidates[0][1],
                     "column": candidates[0][2],
-                    "entity_type": candidates[0][3],
-                    "confidence": candidates[0][6]
+                    "entity_type": etype,
+                    "confidence": candidates[0][5]
                 }
                 logger.info("[2.%d] Mapped: '%s' -> '%s' (score=%.3f, vec_dist=%.3f, text_sim=%.3f)",
                             i + 1, original, best["canonical"],
-                            candidates[0][6], candidates[0][4], candidates[0][5])
+                            candidates[0][5], candidates[0][3], candidates[0][4])
             else:
-                best = {"original": original, "canonical": original, "confidence": 0.5}
+                best = {"original": original, "canonical": original, "entity_type": etype, "confidence": 0.5}
                 logger.info("[2.%d] No match, fallback to original: '%s'", i + 1, original)
 
             grounded.append(best)
@@ -238,14 +272,37 @@ def dynamic_grounding(state: AgentState):
 
 
 def schema_retriever(state: AgentState):
-    """Node 3: Retrieve relevant schema docs via vector search."""
+    """Node 3: Entity-enriched schema retrieval。
+
+    把已 grounding 到的表名/列名/canonical 值拼接到 query 后，提高检索召回率。
+    """
     logger.info("[3] Schema Retriever start")
     start = time.time()
 
     vectorstore = get_schema_vectorstore()
-    docs = vectorstore.similarity_search(state['query'], k=8)
 
+    # Entity enrichment: 把 grounded entities 中的 table/column/canonical 拼到 query
+    enrichment_tokens = []
+    for ent in state.get("grounded_entities", []) or []:
+        if ent.get("table"):
+            enrichment_tokens.append(ent["table"])
+        if ent.get("column"):
+            enrichment_tokens.append(ent["column"])
+        if ent.get("canonical") and ent.get("canonical") != ent.get("original"):
+            enrichment_tokens.append(str(ent["canonical"]))
+
+    enriched_query = state['query']
+    if enrichment_tokens:
+        enriched_query = f"{state['query']} {' '.join(set(enrichment_tokens))}"
+        logger.info("[3] Enriched query tokens: %s", list(set(enrichment_tokens))[:10])
+
+    docs = vectorstore.similarity_search(enriched_query, k=15)
     schema_str = "\n\n".join([doc.page_content for doc in docs])
+
+    # 打印检索到的文档内容
+    for idx, doc in enumerate(docs):
+        logger.info("=== 检索到文档 [%d] (table=%s, type=%s) ===\n%s\n=== 文档 [%d] 结束 ===",
+                    idx, doc.metadata.get("table"), doc.metadata.get("type"), doc.page_content, idx)
 
     logger.info("[3] Retrieved %d schema docs", len(docs))
     logger.info("[3] Schema Retriever done (%.2fs)", time.time() - start)
@@ -253,7 +310,7 @@ def schema_retriever(state: AgentState):
 
 
 def sql_planner_generator(state: AgentState):
-    """Node 4: Plan + generate SQL in a single LLM call (merged planner & generator)."""
+    """Node 4: Plan + generate SQL，注入历史 few-shot 示例（Vanna 风格闭环）。"""
     logger.info("[4] SQL Planner+Generator start")
     start = time.time()
 
@@ -263,9 +320,20 @@ def sql_planner_generator(state: AgentState):
     if not grounded_entities:
         logger.warning("[4] No grounded entities, SQL generation may be inaccurate")
 
-    system_prompt = SQL_GENERATION_SYSTEM_TEMPLATE.format(
+    # 检索相似历史查询
+    few_shots = search_similar_examples(state['query'], top_k=3, min_similarity=0.8)
+
+    # 检测数据库是否有空间数据（决定是否注入 PostGIS 规则）
+    try:
+        spatial = has_spatial_data()
+    except Exception:
+        spatial = False
+
+    system_prompt = build_sql_generation_prompt(
         relevant_schema=state.get('relevant_schema', ''),
-        grounded_entities=grounded_str
+        grounded_entities=grounded_str,
+        has_spatial=spatial,
+        few_shots=few_shots,
     )
 
     resp = llm.invoke([
@@ -274,14 +342,15 @@ def sql_planner_generator(state: AgentState):
     ])
     sql = strip_sql_markdown(resp.content)
 
-    logger.info("[4] SQL Planner+Generator done (%.2fs)", time.time() - start)
+    logger.info("[4] SQL Planner+Generator done (%.2fs, has_spatial=%s, few_shots=%d)",
+                time.time() - start, spatial, len(few_shots))
     logger.info("[4] Generated SQL:\n%s", sql)
 
     return {"sql": sql}
 
 
 def sql_reviewer(state: AgentState):
-    """Node 5: Validate, execute SQL, and auto-fix on error."""
+    """Node 5: EXPLAIN 预校验 + 迭代修复（最多 2 轮）+ 实际执行。"""
     logger.info("[5] SQL Reviewer start")
     start = time.time()
     sql = state.get("sql", "")
@@ -290,45 +359,102 @@ def sql_reviewer(state: AgentState):
         logger.error("[5] SQL is empty")
         return {"error": "SQL 为空", "final_sql": ""}
 
-    sql_to_execute = strip_sql_markdown(sql)
-    if not sql_to_execute:
-        logger.error("[5] SQL empty after cleanup")
+    current_sql = strip_sql_markdown(sql)
+    if not current_sql:
         return {"error": "清理后 SQL 为空", "final_sql": ""}
 
-    if not is_safe_sql(sql_to_execute):
+    if not is_safe_sql(current_sql):
         logger.warning("[5] SQL safety check failed")
-        return {"error": "生成的 SQL 不安全", "final_sql": sql_to_execute}
+        return {"error": "生成的 SQL 不安全", "final_sql": current_sql}
 
     try:
-        logger.info("[5] SQL safety check passed, executing...")
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"SET statement_timeout = '10s'; {sql_to_execute}")
-                col_names = [desc[0] for desc in cur.description] if cur.description else []
-                rows = cur.fetchall()
+        spatial = has_spatial_data()
+    except Exception:
+        spatial = False
 
-        logger.info("[5] SQL executed OK, %d rows (%.2fs)", len(rows), time.time() - start)
-        return {
-            "final_sql": sql_to_execute,
-            "error": None,
-            "query_results": rows,
-            "column_names": col_names,
-        }
+    relevant_schema = state.get("relevant_schema", "")
+    error_history: List[str] = []
+    MAX_FIX_ROUNDS = 2
 
-    except Exception as e:
-        logger.error("[5] SQL execution failed: %s", e)
-        logger.error("[5] SQL was:\n%s", sql_to_execute)
+    for attempt in range(MAX_FIX_ROUNDS + 1):  # 1 次初始 + 最多 2 次修复
+        # === 1. EXPLAIN 预校验（语法 + schema 有效性）===
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SET statement_timeout = '5s'")
+                    cur.execute(f"EXPLAIN {current_sql}")
+                    cur.fetchall()
+            logger.info("[5.%d] EXPLAIN passed", attempt)
+        except Exception as e:
+            err_msg = f"[{_classify_error(str(e))}] {str(e)}"
+            logger.warning("[5.%d] EXPLAIN failed: %s", attempt, err_msg[:200])
 
-        # Auto-fix via LLM
-        fix_prompt = SQL_FIX_TEMPLATE.format(sql=sql_to_execute, error=str(e))
-        logger.info("[5] Fix prompt:\n%s", fix_prompt)
+            if attempt >= MAX_FIX_ROUNDS:
+                logger.error("[5] 已达最大修复轮次，放弃")
+                return {"error": str(e), "final_sql": current_sql}
 
+            error_history.insert(0, err_msg)
+            current_sql = _fix_sql(current_sql, error_history, relevant_schema, spatial)
+            if not current_sql or not is_safe_sql(current_sql):
+                return {"error": "修复后的 SQL 无效或不安全",
+                        "final_sql": current_sql or "",
+                        "error_history": error_history}
+            continue  # 继续下一轮 EXPLAIN
+
+        # === 2. 实际执行 ===
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SET statement_timeout = '10s'")
+                    cur.execute(current_sql)
+                    col_names = [desc[0] for desc in cur.description] if cur.description else []
+                    rows = cur.fetchall()
+
+            logger.info("[5] SQL executed OK, %d rows (%.2fs, attempts=%d)",
+                        len(rows), time.time() - start, attempt + 1)
+            return {
+                "final_sql": current_sql,
+                "error": None,
+                "query_results": rows,
+                "column_names": col_names,
+            }
+
+        except Exception as e:
+            err_msg = f"[{_classify_error(str(e))}] {str(e)}"
+            logger.error("[5.%d] 执行失败: %s", attempt, err_msg[:200])
+
+            if attempt >= MAX_FIX_ROUNDS:
+                logger.error("[5] 已达最大修复轮次，放弃")
+                return {"error": str(e), "final_sql": current_sql}
+
+            error_history.insert(0, err_msg)
+            current_sql = _fix_sql(current_sql, error_history, relevant_schema, spatial)
+            if not current_sql or not is_safe_sql(current_sql):
+                return {"error": "修复后的 SQL 无效或不安全",
+                        "final_sql": current_sql or ""}
+
+    # 不应到这里
+    return {"error": "异常的修复流程", "final_sql": current_sql}
+
+
+def _fix_sql(sql: str, error_history: List[str], relevant_schema: str, spatial: bool) -> str:
+    """调用 LLM 修复 SQL。"""
+    fix_prompt = build_sql_fix_prompt(
+        sql=sql,
+        error_history=error_history,
+        relevant_schema=relevant_schema,
+        has_spatial=spatial,
+    )
+    logger.info("[Fix] Fix prompt (first 500):\n%s", fix_prompt[:500])
+
+    try:
         fixed_raw = llm.invoke([HumanMessage(content=fix_prompt)]).content.strip()
-        logger.info("[5] Fixed raw:\n%s", fixed_raw)
-
         fixed = strip_sql_markdown(fixed_raw)
-        logger.info("[5] Auto-fixed SQL:\n%s", fixed)
-        return {"error": str(e), "sql": fixed}
+        logger.info("[Fix] Fixed SQL:\n%s", fixed)
+        return fixed
+    except Exception as e:
+        logger.error("[Fix] LLM 修复调用失败: %s", e)
+        return sql  # 返回原 SQL，让外层判断放弃
 
 
 # ====================== LangGraph DAG Workflow ======================
@@ -336,20 +462,20 @@ def sql_reviewer(state: AgentState):
 #                 ┌→ extractor → grounding ───┐
 # START → fork → │                             ├→ sql_planner_generator → reviewer → END
 #                 └→ schema_retriever ────────┘
+#
+# 注意：schema_retriever 现在会用 grounded_entities 做 enrichment，但 grounding 也写该 key，
+# 所以图结构保持不变（retriever 读的是 merge 之后的状态）
 
 def _fork(state: AgentState):
-    """Pass-through node that fans out to parallel branches."""
     return {}
 
 
 def _merge(state: AgentState):
-    """Pass-through node that joins parallel branches."""
     return {}
 
 
 workflow = StateGraph(AgentState)
 
-# Nodes
 workflow.add_node("fork", _fork)
 workflow.add_node("extractor", entity_extractor)
 workflow.add_node("grounding", dynamic_grounding)
@@ -358,20 +484,11 @@ workflow.add_node("merge", _merge)
 workflow.add_node("generator", sql_planner_generator)
 workflow.add_node("reviewer", sql_reviewer)
 
-# Edges: fan-out from fork
 workflow.set_entry_point("fork")
 workflow.add_edge("fork", "extractor")
-workflow.add_edge("fork", "retriever")
-
-# Entity branch: extractor → grounding → merge
 workflow.add_edge("extractor", "grounding")
-workflow.add_edge("grounding", "merge")
-
-# Schema branch: retriever → merge
-workflow.add_edge("retriever", "merge")
-
-# After merge: generate → review → end
-workflow.add_edge("merge", "generator")
+workflow.add_edge("grounding", "retriever")  # 改为串行，让 retriever 能用 grounded_entities
+workflow.add_edge("retriever", "generator")
 workflow.add_edge("generator", "reviewer")
 workflow.add_edge("reviewer", END)
 

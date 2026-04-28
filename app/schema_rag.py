@@ -1,8 +1,9 @@
 import logging
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict, List, Optional, Set
 import warnings
 
-from sqlalchemy import create_engine, text, inspect, quoted_name
+from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.engine import Engine
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
@@ -94,7 +95,12 @@ class MSchema:
                             self.add_implicit_foreign_key(t_name, c_name, target_t, target_pk)
                             explicit_links.add(link_key)
 
-    def to_enhanced_mschema(self) -> str:
+    def to_enhanced_mschema(self, has_spatial: bool = False) -> str:
+        """转换为完整 M-Schema 文本。
+
+        Args:
+            has_spatial: 若为 True 则在末尾追加 PostGIS 通用知识；否则只追加通用 SQL 知识
+        """
         lines = [f"【DB_ID】 {self.db_id}", "【Schema】"]
 
         for table_name, table_info in self.tables.items():
@@ -146,30 +152,76 @@ class MSchema:
                             f"JOIN {source_t} ON {source_t}.{source_col} = {table_name}.{my_col} ({fk_type})"
                         )
 
-        lines.append("\n【General SQL & PostGIS Knowledge】")
+        lines.append("\n【General SQL Knowledge】")
         lines.append("- Use JOIN strictly according to the 'Relationships' paths above.")
-        lines.append("- Spatial: ST_Contains, ST_Intersects, ST_DWithin, ST_Distance, etc.")
-        lines.append("- Always JOIN a table with GEOMETRY column before using spatial functions.")
+        lines.append("- Use standard PostgreSQL syntax (CTE / WITH / subqueries are allowed).")
+
+        if has_spatial:
+            lines.append("\n【PostGIS Spatial Knowledge】")
+            lines.append("- Spatial functions: ST_Contains, ST_Intersects, ST_DWithin, ST_Distance, ST_Within.")
+            lines.append("- Always JOIN a table with GEOMETRY column before applying spatial functions.")
+            lines.append("- For geometry output use ST_AsText() or ST_AsGeoJSON() to get readable text.")
 
         return "\n".join(lines)
 
 
+# ====================== IGNORE_TABLES 动态构建 ======================
+
+_INTERNAL_TABLES = {"value_embeddings", "sql_examples"}  # 本项目内部表，固定忽略
+_POSTGIS_SYSTEM_TABLES = {"spatial_ref_sys", "geometry_columns", "geography_columns"}
+
+
+def _detect_postgis(engine: Engine) -> bool:
+    """检测数据库是否启用了 PostGIS 扩展。"""
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(
+                "SELECT 1 FROM pg_extension WHERE extname = 'postgis' LIMIT 1"
+            ))
+            return result.fetchone() is not None
+    except Exception as e:
+        logger.debug("检测 PostGIS 扩展失败（忽略）: %s", e)
+        return False
+
+
+def _build_ignore_tables(engine: Engine) -> Set[str]:
+    """动态构建要忽略的表集合。
+
+    规则：
+    - 始终忽略本项目内部表（value_embeddings, sql_examples）
+    - 若检测到 PostGIS 扩展，追加 PostGIS 系统表
+    - 用户可通过 .env 的 IGNORE_TABLES=t1,t2,t3 扩展
+    """
+    ignore = set(_INTERNAL_TABLES)
+
+    if _detect_postgis(engine):
+        ignore.update(_POSTGIS_SYSTEM_TABLES)
+        logger.info("检测到 PostGIS 扩展，已追加空间系统表到忽略列表")
+
+    extra = os.getenv("IGNORE_TABLES", "").strip()
+    if extra:
+        user_ignore = {t.strip() for t in extra.split(",") if t.strip()}
+        ignore.update(user_ignore)
+        logger.info("用户自定义忽略表: %s", user_ignore)
+
+    return ignore
+
+
 # ====================== EnhancedSchemaEngine ======================
 class EnhancedSchemaEngine:
-    IGNORE_TABLES = {'spatial_ref_sys', 'geometry_columns', 'geography_columns', 'value_embeddings'}
-
     def __init__(self, db_url: str = DB_URL, sample_rows: int = 5):
         self.engine: Engine = create_engine(db_url, echo=False, pool_pre_ping=True)
         self.mschema = MSchema(db_id="dynamic_db", schema="public")
         self.has_spatial_data = False
         self.sample_rows = sample_rows
+        self.ignore_tables = _build_ignore_tables(self.engine)
 
     def build(self) -> MSchema:
         inspector = inspect(self.engine)
 
         tables = inspector.get_table_names(schema="public")
         for table_name in tables:
-            if table_name in self.IGNORE_TABLES:
+            if table_name in self.ignore_tables:
                 continue
 
             comment_dict = inspector.get_table_comment(table_name, schema="public")
@@ -213,32 +265,62 @@ class EnhancedSchemaEngine:
         # Batch fetch all distinct values with a single connection
         self._batch_fetch_examples()
 
-        self.mschema.infer_implicit_fks(ignore_tables=self.IGNORE_TABLES)
+        self.mschema.infer_implicit_fks(ignore_tables=self.ignore_tables)
 
-        logger.info("M-Schema 构建完成: %d 张表, 显式 FK %d, 逻辑 FK %d",
+        logger.info("M-Schema 构建完成: %d 张表, 显式 FK %d, 逻辑 FK %d, 空间数据: %s",
                      len(self.mschema.tables),
                      len(self.mschema.foreign_keys),
-                     len(self.mschema.implicit_foreign_keys))
+                     len(self.mschema.implicit_foreign_keys),
+                     self.has_spatial_data)
         return self.mschema
 
     def _batch_fetch_examples(self):
-        """Fetch distinct values for all columns using a single connection."""
-        with self.engine.connect() as conn:
-            for table_name, table_info in self.mschema.tables.items():
-                for col_name, col_info in table_info["fields"].items():
-                    try:
-                        # Use quoted identifiers to prevent SQL injection
-                        query = text(
-                            f'SELECT DISTINCT "{table_name}"."{col_name}" '
-                            f'FROM "{table_name}" '
-                            f'WHERE "{table_name}"."{col_name}" IS NOT NULL '
-                            f'LIMIT :limit'
-                        )
-                        result = conn.execute(query, {"limit": self.sample_rows})
-                        col_info["examples"] = [row[0] for row in result.fetchall() if row[0] is not None]
-                    except Exception:
-                        col_info["examples"] = []
-
+           """
+           极速且安全的数据采样：
+           1. 使用 SELECT * 避免全表扫描
+           2. 过滤掉无意义的大字段类型
+           3. 对过长的数据样本进行截断，防止撑爆 Embedding 模型
+           """
+           # 设定一个样例的最大字符长度，超过则截断
+           MAX_EXAMPLE_LENGTH = 50 
+           
+           with self.engine.connect() as conn:
+               for table_name, table_info in self.mschema.tables.items():
+                   try:
+                       # 1. 整表取前几行，避免按列查
+                       query = text(f'SELECT * FROM "{table_name}" LIMIT :limit')
+                       result = conn.execute(query, {"limit": self.sample_rows}).mappings().all()
+    
+                       for col_name, col_info in table_info["fields"].items():
+                           col_type = col_info["type"].lower()
+                           
+                           # 2. 【类型过滤】：跳过这些又长又没必要做样例的字段
+                           if any(x in col_type for x in ("geometry", "geography", "bytea", "blob", "json")):
+                               col_info["examples"] = []
+                               continue
+                            
+                           # 3. 【暴力截断】：安全提取数据
+                           examples_set = set()
+                           for row in result:
+                               val = row.get(col_name)
+                               if val is not None:
+                                   # 转为字符串处理
+                                   val_str = str(val).strip()
+                                   # 如果字符串太长，直接截断
+                                   if len(val_str) > MAX_EXAMPLE_LENGTH:
+                                       val_str = val_str[:MAX_EXAMPLE_LENGTH] + "..."
+                                   # 去除空字符串的情况
+                                   if val_str:
+                                       examples_set.add(val_str)
+                                       
+                           col_info["examples"] = list(examples_set)
+    
+                   except Exception as e:
+                       logger.warning(f"提取表 {table_name} 样例数据失败 (跳过): {e}")
+                       for col_info in table_info["fields"].values():
+                           if "examples" not in col_info:
+                               col_info["examples"] = []
+    
     def get_docs(self) -> List[Document]:
         self.build()
         docs = []
@@ -252,10 +334,11 @@ class EnhancedSchemaEngine:
 
         if self.has_spatial_data:
             postgis_doc = """
-General SQL & PostGIS Knowledge (No specific tables):
+PostGIS Spatial Knowledge (no specific tables):
 - Use JOIN strictly according to the 'Relationships (JOIN Paths)' in each table.
-- Spatial functions: ST_Contains, ST_Intersects, ST_DWithin, ST_Distance, etc.
-- Always JOIN a table containing GEOMETRY column before applying spatial functions.
+- Spatial functions: ST_Contains, ST_Intersects, ST_DWithin, ST_Distance, ST_Within, etc.
+- Always JOIN a table containing a GEOMETRY column before applying spatial functions.
+- For geometry output, wrap with ST_AsText() or ST_AsGeoJSON() for readable results.
 """
             docs.append(Document(
                 page_content=postgis_doc.strip(),
@@ -299,6 +382,16 @@ General SQL & PostGIS Knowledge (No specific tables):
 # ====================== 对外接口 ======================
 _vectorstore = None
 _schema_docs_cache = None
+_engine_cache: Optional[EnhancedSchemaEngine] = None
+
+
+def _get_engine() -> EnhancedSchemaEngine:
+    """获取或创建全局 EnhancedSchemaEngine 单例。"""
+    global _engine_cache
+    if _engine_cache is None:
+        _engine_cache = EnhancedSchemaEngine(DB_URL)
+    return _engine_cache
+
 
 def get_dynamic_m_schema_docs() -> list[Document]:
     global _schema_docs_cache
@@ -309,7 +402,7 @@ def get_dynamic_m_schema_docs() -> list[Document]:
 
     try:
         logger.info("正在执行 M-Schema 自动化构建...")
-        engine = EnhancedSchemaEngine(DB_URL)
+        engine = _get_engine()
         _schema_docs_cache = engine.get_docs()
         logger.info("M-Schema 文档缓存完成")
         return _schema_docs_cache
@@ -333,6 +426,11 @@ def get_schema_vectorstore():
         schema_docs = get_dynamic_m_schema_docs()
         logger.info("开始向量化 %d 个 Schema 文档...", len(schema_docs))
 
+        # 打印待向量化的文档内容
+        for idx, doc in enumerate(schema_docs):
+            logger.info("=== 待向量化文档 [%d] ===\n%s\n=== 文档 [%d] 结束 ===", idx, doc.page_content, idx)
+
+
         _vectorstore = InMemoryVectorStore.from_documents(
             documents=schema_docs,
             embedding=bge_embeddings,
@@ -344,3 +442,55 @@ def get_schema_vectorstore():
     except Exception as e:
         logger.error("Schema RAG 初始化失败: %s", e, exc_info=True)
         raise
+
+
+def has_spatial_data() -> bool:
+    """返回当前数据库是否包含 geometry/geography 列。
+
+    用于动态决定是否在 prompt 中注入 PostGIS 规则。
+    """
+    engine = _get_engine()
+    if not engine.mschema.tables:  # 尚未构建
+        engine.build()
+    return engine.has_spatial_data
+
+
+def get_schema_summary(max_cols_per_table: int = 6) -> str:
+    """返回紧凑的 schema 摘要，供 schema-aware 实体提取使用。
+
+    格式示例：
+        Tables:
+        - products (产品表): id, name, category, price, status
+        - orders (订单表): order_id, customer_id, amount, order_date
+        - ...
+
+    Args:
+        max_cols_per_table: 每张表最多显示多少列（优先显示主键 + 非外键列）
+    """
+    engine = _get_engine()
+    if not engine.mschema.tables:
+        engine.build()
+
+    lines = ["Tables:"]
+    for table_name, table_info in engine.mschema.tables.items():
+        comment = table_info.get("comment", "")
+
+        # 优先选择主键 + 关键列（过滤掉纯几何/embedding 列）
+        cols = []
+        for col_name, col in table_info["fields"].items():
+            col_type = col.get("type", "").lower()
+            # 跳过几何和大字段
+            if any(x in col_type for x in ("geometry", "geography", "bytea")):
+                continue
+            cols.append(col_name)
+
+        cols = cols[:max_cols_per_table]
+        col_str = ", ".join(cols)
+
+        header = f"- {table_name}"
+        if comment:
+            header += f" ({comment})"
+        header += f": {col_str}"
+        lines.append(header)
+
+    return "\n".join(lines)
