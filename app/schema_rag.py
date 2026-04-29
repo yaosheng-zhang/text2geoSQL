@@ -7,6 +7,7 @@ from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.engine import Engine
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_community.retrievers import BM25Retriever
 
 from app.config import bge_embeddings, DB_URL
 
@@ -383,7 +384,7 @@ PostGIS Spatial Knowledge (no specific tables):
 _vectorstore = None
 _schema_docs_cache = None
 _engine_cache: Optional[EnhancedSchemaEngine] = None
-
+_bm25_retriever_cache = None  
 
 def _get_engine() -> EnhancedSchemaEngine:
     """获取或创建全局 EnhancedSchemaEngine 单例。"""
@@ -494,3 +495,33 @@ def get_schema_summary(max_cols_per_table: int = 6) -> str:
         lines.append(header)
 
     return "\n".join(lines)
+
+def get_schema_bm25_retriever():
+    """
+    获取或初始化全局的 BM25 Retriever。
+    直接复用 get_dynamic_m_schema_docs() 产生的高质量 Schema 文档。
+    """
+    global _bm25_retriever_cache
+
+    if _bm25_retriever_cache is not None:
+        logger.info("使用缓存的 Schema BM25 检索器")
+        return _bm25_retriever_cache
+
+    logger.info("正在初始化 Schema RAG BM25 检索器...")
+    try:
+        # 直接复用你之前写好的文档缓存，不需要重新查询数据库
+        schema_docs = get_dynamic_m_schema_docs()
+        
+        if not schema_docs:
+            logger.warning("没有可用的 Schema 文档，无法构建 BM25。")
+            return None
+
+        # 构建 BM25 索引 (在内存中建立词频倒排表，速度极快)
+        _bm25_retriever_cache = BM25Retriever.from_documents(schema_docs)
+        _bm25_retriever_cache.k = 10  # 设置默认返回前 10 个相关表
+        
+        logger.info("Schema BM25 检索器初始化完成，包含 %d 个表文档", len(schema_docs))
+        return _bm25_retriever_cache
+    except Exception as e:
+        logger.error("Schema BM25 初始化失败: %s", e, exc_info=True)
+        return None

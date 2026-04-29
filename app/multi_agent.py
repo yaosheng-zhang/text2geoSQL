@@ -2,6 +2,9 @@ from langgraph.graph import StateGraph, END
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import PromptTemplate
+from langchain_classic.retrievers import EnsembleRetriever
+
+
 from pydantic import BaseModel, Field
 from typing import TypedDict, List, Optional
 import json
@@ -10,7 +13,7 @@ import time
 
 from app.config import llm, bge_embedding_model
 from app.db import get_connection
-from app.schema_rag import get_schema_vectorstore, get_schema_summary, has_spatial_data
+from app.schema_rag import get_schema_vectorstore, get_schema_summary, has_spatial_data,get_schema_bm25_retriever
 from app.utils import is_safe_sql
 from app.few_shot import search_similar_examples
 from app.prompts import (
@@ -225,7 +228,7 @@ def dynamic_grounding(state: AgentState):
                 top1_score = candidates[0][5]
                 top2_score = candidates[1][5]
 
-                if abs(top1_score - top2_score) < 0.10:
+                if abs(top1_score - top2_score) < 0.05:
                     logger.info("[2.%d] Scores close (%.3f vs %.3f), triggering LLM rerank",
                                 i + 1, top1_score, top2_score)
                     candidates_str = "\n".join([
@@ -272,16 +275,16 @@ def dynamic_grounding(state: AgentState):
 
 
 def schema_retriever(state: AgentState):
-    """Node 3: Entity-enriched schema retrieval。
-
-    把已 grounding 到的表名/列名/canonical 值拼接到 query 后，提高检索召回率。
-    """
+    """Node 3: 混合检索 (Vector 语义 + BM25 精准匹配)。"""
     logger.info("[3] Schema Retriever start")
     start = time.time()
 
+    # 获取底层检索器
     vectorstore = get_schema_vectorstore()
+    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+    bm25_retriever = get_schema_bm25_retriever()
 
-    # Entity enrichment: 把 grounded entities 中的 table/column/canonical 拼到 query
+    # 1. 从 Grounding 结果中提取精准的 表名、列名、枚举值
     enrichment_tokens = []
     for ent in state.get("grounded_entities", []) or []:
         if ent.get("table"):
@@ -291,21 +294,44 @@ def schema_retriever(state: AgentState):
         if ent.get("canonical") and ent.get("canonical") != ent.get("original"):
             enrichment_tokens.append(str(ent["canonical"]))
 
-    enriched_query = state['query']
-    if enrichment_tokens:
-        enriched_query = f"{state['query']} {' '.join(set(enrichment_tokens))}"
-        logger.info("[3] Enriched query tokens: %s", list(set(enrichment_tokens))[:10])
+    unique_tokens = list(set(enrichment_tokens))
+    query = state['query']
+    docs = []
 
-    docs = vectorstore.similarity_search(enriched_query, k=15)
-    schema_str = "\n\n".join([doc.page_content for doc in docs])
+    # 2. 检索策略分流
+    if unique_tokens and bm25_retriever:
+        # 【策略 A】: 双路混合召回 (RRF)
+        logger.info("[3] 存在 Grounding Tokens %s，启动 Ensemble 混合检索", unique_tokens)
+        
+        # 将自然语言交给向量模型，将精确的 tokens 结合原句交给 BM25
+        # 权重设置：BM25的权重偏高，因为一旦命中真实存在的表/列，相关性一定是极高的
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[vector_retriever, bm25_retriever],
+            weights=[0.4, 0.6] 
+        )
+        
+        combined_query = f"{query} {' '.join(unique_tokens)}"
+        docs = ensemble_retriever.invoke(combined_query)
+    else:
+        # 【策略 B】: 纯向量兜底检索
+        # 如果没有提取到任何真实表列（比如只有纯日期条件），或者 BM25 加载失败，
+        # 则只用纯查询去过向量库。
+        logger.info("[3] 无精确 Tokens 或 BM25 不可用，使用纯向量检索")
+        docs = vector_retriever.invoke(query)
 
-    # 打印检索到的文档内容
-    for idx, doc in enumerate(docs):
-        logger.info("=== 检索到文档 [%d] (table=%s, type=%s) ===\n%s\n=== 文档 [%d] 结束 ===",
-                    idx, doc.metadata.get("table"), doc.metadata.get("type"), doc.page_content, idx)
+    # 3. 截取 Top 15 并组装上下文
+    top_docs = docs[:15]
+    schema_str = "\n\n".join([doc.page_content for doc in top_docs])
 
-    logger.info("[3] Retrieved %d schema docs", len(docs))
+    # 打印检索结果日志 (仅打印前5个避免刷屏)
+    for idx, doc in enumerate(top_docs[:5]):
+        logger.info("=== 检索 Top [%d] (table=%s, type=%s) ===\n%s...",
+                    idx, doc.metadata.get("table"), doc.metadata.get("type"), 
+                    doc.page_content[:80].replace('\n', ' '))
+
+    logger.info("[3] Retrieved %d schema docs", len(top_docs))
     logger.info("[3] Schema Retriever done (%.2fs)", time.time() - start)
+    
     return {"relevant_schema": schema_str}
 
 

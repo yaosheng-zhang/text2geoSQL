@@ -135,6 +135,7 @@ def _create_ollama(
         model=model or "qwen2.5:7b",
         base_url=base_url or "http://localhost:11434",
         temperature=temperature,
+        
         **kwargs,
     )
 
